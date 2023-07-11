@@ -1,0 +1,34 @@
+{
+    "version": "2.0.0",
+    "type": "shell",
+    "tasks": [
+        {
+            "label": "Build client",
+            "command": [
+                "go build -o ../../client.exe"
+            ],
+            "group": "build",
+            "options": {
+                "cwd": "${workspaceFolder}/cmd/client"
+            }
+        },
+        {
+            "label": "Build server",
+            "command": [
+                "go build -o ../../server.exe"
+            ],
+            "group": "build",
+            "options": {
+                "cwd": "${workspaceFolder}/cmd/server"
+            }
+        },
+        {
+            "label": "Build all",
+            "dependsOn": [
+                "Build client",
+                "Build server"
+            ],
+            "problemMatcher": []
+        }
+    ],
+}
