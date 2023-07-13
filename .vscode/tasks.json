@@ -3,32 +3,14 @@
     "type": "shell",
     "tasks": [
         {
-            "label": "Build client",
+            "label": "Build peer",
             "command": [
-                "go build -o ../../client.exe"
+                "go build -o ../../peer.exe"
             ],
             "group": "build",
             "options": {
-                "cwd": "${workspaceFolder}/cmd/client"
+                "cwd": "${workspaceFolder}/cmd/peer"
             }
-        },
-        {
-            "label": "Build server",
-            "command": [
-                "go build -o ../../server.exe"
-            ],
-            "group": "build",
-            "options": {
-                "cwd": "${workspaceFolder}/cmd/server"
-            }
-        },
-        {
-            "label": "Build all",
-            "dependsOn": [
-                "Build client",
-                "Build server"
-            ],
-            "problemMatcher": []
         }
     ],
 }

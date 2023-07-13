@@ -22,13 +22,13 @@ func (t *TranscoderFile) UpdateProjection() {
 }
 
 func (t *TranscoderFile) EncodeFrame() *MultiFrame {
-	//var frames []RemoteInputReceivedFrame
+	var frames []RemoteInputReceivedFrame
 	rFrame := RemoteInputReceivedFrame{0, uint32(len(t.frames[t.frameCounter].Data)), t.frameCounter, t.frames[t.frameCounter].Data}
-	rFrame2 := RemoteInputReceivedFrame{1, uint32(len(t.frames[t.frameCounter].Data)), t.frameCounter, t.frames[t.frameCounter].Data}
-	frames = append(frames, rFrame, rframe2)
-	//mf := t.lEnc.EncodeMultiFrame(frames)
+	//rFrame2 := RemoteInputReceivedFrame{1, uint32(len(t.frames[t.frameCounter].Data)), t.frameCounter, t.frames[t.frameCounter].Data}
+	frames = append(frames, rFrame)
+	mf := t.lEnc.EncodeMultiFrame(frames)
 	t.frameCounter = (t.frameCounter + 1) % 900
-	return t.frames[]
+	return mf
 }
 
 func (t *TranscoderFile) IsReady() bool {

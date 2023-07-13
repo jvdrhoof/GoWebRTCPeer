@@ -6,9 +6,6 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io/ioutil"
-	"net"
-	"net/http"
 	"os"
 	"sync"
 	"time"
@@ -21,37 +18,32 @@ import (
 	"github.com/pion/webrtc/v3"
 )
 
-func signalCandidate(addr string, c *webrtc.ICECandidate) error {
-	payload := []byte(c.ToJSON().Candidate)
-	resp, err := http.Post(fmt.Sprintf("http://%s/candidate", addr), "application/json; charset=utf-8", bytes.NewReader(payload)) //nolint:noctx
-	if err != nil {
-		return err
-	}
-	return resp.Body.Close()
-}
+const (
+	Idle     int = 0
+	Hello        = 1
+	Offer        = 2
+	Answer       = 3
+	Ready        = 4
+	Finished     = 5
+)
 
 func main() {
 	offerAddr := flag.String("offer-address", ":7002", "Address that the Offer HTTP server is hosted on.")
 	answerAddr := flag.String("r", "127.0.0.1:8001", "Address that the Answer HTTP server is hosted on.")
 	useFiles := flag.Bool("f", false, "Use pre encoded files instead or remote input")
 	useVirtualWall := flag.Bool("v", false, "Use virtual wall ip filter")
-	flag.Parse()
-	var transcoder Transcoder
-	if *useFiles {
-		transcoder = NewTranscoderFile()
-	} else {
-		transcoder = NewTranscoderRemote()
-	}
 
+	println(offerAddr, answerAddr, useFiles, useVirtualWall)
+
+	var transcoder Transcoder
+	transcoder = NewTranscoderFile()
 	for !transcoder.IsReady() {
-		println("Waiting")
 		time.Sleep(10 * time.Millisecond)
 	}
+
 	settingEngine := webrtc.SettingEngine{}
 	settingEngine.SetSCTPMaxReceiveBufferSize(16 * 1024 * 1024)
-	if *useVirtualWall {
-		settingEngine.SetIPFilter(VirtualWallFilter)
-	}
+
 	i := &interceptor.Registry{}
 	m := &webrtc.MediaEngine{}
 	if err := m.RegisterDefaultCodecs(); err != nil {
@@ -65,17 +57,9 @@ func main() {
 		panic(err)
 	}
 
-	// Create a Congestion Controller. This analyzes inbound and outbound data and provides
-	// suggestions on how much we should be sending.
-	//
-	// Passing `nil` means we use the default Estimation Algorithm which is Google Congestion Control.
-	// You can use the other ones that Pion provides, or write your own!
-
-	// TODO: ask why these values are initially used
 	congestionController, err := cc.NewInterceptor(func() (cc.BandwidthEstimator, error) {
 		return gcc.NewSendSideBWE(gcc.SendSideBWEMinBitrate(75_000*8), gcc.SendSideBWEInitialBitrate(75_000_000), gcc.SendSideBWEMaxBitrate(262_744_320))
 	})
-
 	if err != nil {
 		panic(err)
 	}
@@ -83,7 +67,6 @@ func main() {
 	estimatorChan := make(chan cc.BandwidthEstimator, 1)
 	congestionController.OnNewPeerConnection(func(id string, estimator cc.BandwidthEstimator) {
 		estimatorChan <- estimator
-		print("test")
 	})
 
 	i.Add(congestionController)
@@ -133,125 +116,105 @@ func main() {
 		}
 	}()
 
-	// When an ICE candidate is available send to the other Pion instance
-	// the other Pion instance will add this candidate by calling AddICECandidate
+	wsHandler := NewWSHandler("193.190.127.152:8000")
+
 	peerConnection.OnICECandidate(func(c *webrtc.ICECandidate) {
 		if c == nil {
 			return
 		}
-
 		candidatesMux.Lock()
-		defer candidatesMux.Unlock()
-
 		desc := peerConnection.RemoteDescription()
 		if desc == nil {
 			pendingCandidates = append(pendingCandidates, c)
-		} else if onICECandidateErr := signalCandidate(*answerAddr, c); onICECandidateErr != nil {
-			panic(onICECandidateErr)
+		} else {
+			payload := []byte(c.ToJSON().Candidate)
+			wsHandler.SendMessage(WebsocketPacket{1, 4, string(payload)})
 		}
+		candidatesMux.Unlock()
 	})
 
-	// An HTTP handler that allows the other Pion instance to send us ICE candidates
-	// This allows us to add ICE candidates faster, we don't have to wait for STUN or TURN
-	// candidates which may be slower
-	http.HandleFunc("/candidate", func(w http.ResponseWriter, r *http.Request) {
-		candidate, candidateErr := ioutil.ReadAll(r.Body)
-		if candidateErr != nil {
-			panic(candidateErr)
-		}
-		if candidateErr := peerConnection.AddICECandidate(webrtc.ICECandidateInit{Candidate: string(candidate)}); candidateErr != nil {
-			panic(candidateErr)
-		}
-	})
-
-	// An HTTP handler that processes a SessionDescription given to us from the other Pion process
-	http.HandleFunc("/sdp", func(w http.ResponseWriter, r *http.Request) {
-		sdp := webrtc.SessionDescription{}
-		if sdpErr := json.NewDecoder(r.Body).Decode(&sdp); sdpErr != nil {
-			panic(sdpErr)
-		}
-
-		if sdpErr := peerConnection.SetRemoteDescription(sdp); sdpErr != nil {
-			panic(sdpErr)
-		}
-
-		candidatesMux.Lock()
-		defer candidatesMux.Unlock()
-
-		for _, c := range pendingCandidates {
-			if onICECandidateErr := signalCandidate(*answerAddr, c); onICECandidateErr != nil {
-				panic(onICECandidateErr)
-			}
-		}
-	})
-
-	// Start HTTP server that accepts requests from the answer process
-	// nolint: gosec
-	go func() { panic(http.ListenAndServe(*offerAddr, nil)) }()
-
-	// Create a datachannel with label 'data'
-	/*dataChannel, err := peerConnection.CreateDataChannel("data", nil)
-	if err != nil {
-		panic(err)
-	}*/
-
-	// Set the handler for Peer connection state
-	// This will notify you when the peer has connected/disconnected
 	peerConnection.OnConnectionStateChange(func(s webrtc.PeerConnectionState) {
 		fmt.Printf("Peer Connection State has changed: %s\n", s.String())
-
 		if s == webrtc.PeerConnectionStateFailed {
-			// Wait until PeerConnection has had no network activity for 30 seconds or another failure. It may be reconnected using an ICE Restart.
-			// Use webrtc.PeerConnectionStateDisconnected if you are interested in detecting faster timeout.
-			// Note that the PeerConnection may come back from PeerConnectionStateDisconnected.
 			fmt.Println("Peer Connection has gone to failed exiting")
 			os.Exit(0)
 		}
 	})
 
-	// Register channel opening handling
-	/*dataChannel.OnOpen(func() {
-		fmt.Printf("Data channel '%s'-'%d' open. Random messages will now be sent to any connected DataChannels every 5 seconds\n", dataChannel.Label(), dataChannel.ID())
-		for range time.NewTicker(5 * time.Second).C {
-			message := "SERVER"
-			fmt.Printf("Sending '%s'\n", message)
-			print(estimator.GetStats())
-			// Send the message as text
-			sendTextErr := dataChannel.SendText(message)
-			if sendTextErr != nil {
-				panic(sendTextErr)
+	var state = Idle
+	print(state)
+
+	var handleMessageCallback = func(wsPacket WebsocketPacket) {
+		switch wsPacket.MessageType {
+		case 1: // hello
+			println("Received hello")
+			offer, err := peerConnection.CreateOffer(nil)
+			if err != nil {
+				panic(err)
 			}
+			if err = peerConnection.SetLocalDescription(offer); err != nil {
+				panic(err)
+			}
+			payload, err := json.Marshal(offer)
+			if err != nil {
+				panic(err)
+			}
+			wsHandler.SendMessage(WebsocketPacket{1, 2, string(payload)})
+			state = Hello
+		case 2: // offer
+			println("Received offer")
+			offer := webrtc.SessionDescription{}
+			err := json.Unmarshal([]byte(wsPacket.Message), &offer)
+			if err != nil {
+				panic(err)
+			}
+			peerConnection.SetRemoteDescription(offer)
+			answer, err := peerConnection.CreateAnswer(nil)
+			if err != nil {
+				panic(err)
+			}
+			if err = peerConnection.SetLocalDescription(answer); err != nil {
+				panic(err)
+			}
+			payload, err := json.Marshal(answer)
+			if err != nil {
+				panic(err)
+			}
+			wsHandler.SendMessage(WebsocketPacket{1, 3, string(payload)})
+			state = Offer
+		case 3: // answer
+			println("Received answer")
+			answer := webrtc.SessionDescription{}
+			err := json.Unmarshal([]byte(wsPacket.Message), &answer)
+			if err != nil {
+				panic(err)
+			}
+			if err := peerConnection.SetRemoteDescription(answer); err != nil {
+				panic(err)
+			}
+			candidatesMux.Lock()
+			for _, c := range pendingCandidates {
+				payload := []byte(c.ToJSON().Candidate)
+				wsHandler.SendMessage(WebsocketPacket{1, 4, string(payload)})
+			}
+			candidatesMux.Unlock()
+			state = Answer
+		case 4: // candidate
+			println("Received candidate")
+			candidate := wsPacket.Message
+			if candidateErr := peerConnection.AddICECandidate(webrtc.ICECandidateInit{Candidate: candidate}); candidateErr != nil {
+				panic(candidateErr)
+			}
+		default:
+			println(fmt.Sprintf("Received non-compliant message type %d", wsPacket.MessageType))
 		}
-	})
-	// Register text message handling
-	dataChannel.OnMessage(func(msg webrtc.DataChannelMessage) {
-		fmt.Printf("Message from DataChannel '%s': '%s'\n", dataChannel.Label(), string(msg.Data))
-	})*/
-
-	// Create an offer to send to the other process
-	offer, err := peerConnection.CreateOffer(nil)
-	if err != nil {
-		panic(err)
 	}
 
-	// Sets the LocalDescription, and starts our UDP listeners
-	// Note: this will start tFaddhe gathering of ICE candidates
-	if err = peerConnection.SetLocalDescription(offer); err != nil {
-		panic(err)
-	}
+	wsHandler.StartListening(handleMessageCallback)
+	wsHandler.SendMessage(WebsocketPacket{1, 1, "Hello"})
 
-	// Send our offer to the HTTP server listening in the other process
-	payload, err := json.Marshal(offer)
-	if err != nil {
-		panic(err)
-	}
+	select {}
 
-	resp, err := http.Post(fmt.Sprintf("http://%s/sdp", *answerAddr), "application/json; charset=utf-8", bytes.NewReader(payload)) // nolint:noctx
-	if err != nil {
-		panic(err)
-	} else if err := resp.Body.Close(); err != nil {
-		panic(err)
-	}
 	oldEpochMilliseconds := time.Now().UnixNano() / int64(time.Millisecond)
 	println(estimator.GetTargetBitrate(), oldEpochMilliseconds)
 	msCounter := int(0)
@@ -260,7 +223,6 @@ func main() {
 	delayRate := int(0)
 	lossRate := int(0)
 	for ; true; <-time.NewTicker(20 * time.Millisecond).C {
-		//currentTime := time.Now()
 		tFrames++
 		epochMilliseconds := time.Now().UnixNano() / int64(time.Millisecond)
 		targetBitrate := uint32(estimator.GetTargetBitrate())
@@ -271,13 +233,9 @@ func main() {
 		vLossRate, _ := estimator.GetStats()["lossTargetBitrate"]
 		vDelayRate, _ := estimator.GetStats()["delayTargetBitrate"]
 		vLoss, _ := estimator.GetStats()["averageLoss"]
-
 		lossRate += vLossRate.(int)
 		delayRate += vDelayRate.(int)
 		loss += vLoss.(float64)
-		/*for key, value := range estimator.GetStats() {
-			fmt.Println(key, value)
-		}*/
 		msCounter += int(epochMilliseconds - oldEpochMilliseconds)
 		if uint64(msCounter/1000) > 0 {
 			println("MS ", msCounter)
@@ -292,13 +250,8 @@ func main() {
 			lossRate = 0
 			loss = 0.0
 			tFrames = 0
-			// lossTargetBitrate
-			// averageLoss
-			// delayTargetBitrate
 		}
-		//println("TARGET RATE ", epochMilliseconds-oldEpochMilliseconds);
 		oldEpochMilliseconds = epochMilliseconds
-		//runtime.GC()
 	}
 	// Block forever
 	select {}
@@ -311,13 +264,6 @@ type TrackLocalCloudRTP struct {
 	sequencer  rtp.Sequencer
 	rtpTrack   *webrtc.TrackLocalStaticRTP
 	clockRate  float64
-}
-
-func VirtualWallFilter(addr net.IP) bool {
-	if addr.String() == "192.168.0.1" {
-		return true
-	}
-	return false
 }
 
 // NewTrackLocalStaticSample returns a TrackLocalStaticSample
@@ -409,21 +355,7 @@ func (s *TrackLocalCloudRTP) WritePointCloud(t Transcoder) error {
 
 		}
 		counter += 1
-		/*if counter % 25 == 0 {
-			oldEpochMilliseconds := time.Now().UnixNano()
-			//C.wait(C.int(100))
-			time.Sleep(1 * time.Nanosecond)
-			//smallWait()
-			currentTime := time.Now()
-			epochMilliseconds := currentTime.UnixNano()
-			println("WAIT ", epochMilliseconds-oldEpochMilliseconds)
-		}*/
 	}
-	/*if (t.GetFrameNr() - 1) % 5 == 0 {
-		timestamp := time.Now().UnixNano() / int64(time.Millisecond)
-		data := fmt.Sprintf("%d;%d;%d\n", timestamp, t.GetFrameNr()-1, len(frameData.Data))
-		file.WriteString(data)
-	}*/
 	return nil
 }
 func smallWait() {
@@ -439,18 +371,9 @@ type PointCloudPayloader struct {
 // Payload fragments a AV1 packet across one or more byte arrays
 // See AV1Packet for description of AV1 Payload Header
 func (p *PointCloudPayloader) Payload(mtu uint16, payload []byte) (payloads [][]byte) {
-
-	//maxFragmentSize := mtu // TODO subtract point cloud header
-	//	payloadDataRemaining := len(payload)
-	//payloadDataIndex := uint32(0)
 	payloadDataOffset := uint32(0)
 	payloadLen := uint32(len(payload))
 	payloadRemaining := payloadLen
-	// Make sure the fragment/payload size is correct
-	/*if math.Min(maxFragmentSize, payloadDataRemaining) <= 0 {
-		return payloads
-	}
-	*/
 	for payloadRemaining > 0 {
 		currentFragmentSize := uint32(1180)
 		if payloadRemaining < currentFragmentSize {
@@ -463,7 +386,6 @@ func (p *PointCloudPayloader) Payload(mtu uint16, payload []byte) (payloads [][]
 			panic(err)
 		}
 		payloads = append(payloads, buf.Bytes())
-		//payloadDataIndex++
 		payloadDataOffset += currentFragmentSize
 		payloadRemaining -= currentFragmentSize
 	}
