@@ -3,7 +3,6 @@ package main
 import (
 	"io/ioutil"
 	"log"
-	"strconv"
 )
 
 type FileData struct {
@@ -11,19 +10,23 @@ type FileData struct {
 	Data []byte
 }
 
-func ReadBinaryFiles(dir string, prefix string) ([]FileData, error) {
+func ReadBinaryFiles(contentDirectory string) ([]FileData, error) {
 
 	var fileData []FileData
 
-	for i := 0; i < 900; i++ {
-		data, err := ioutil.ReadFile(dir + "/" + prefix + strconv.Itoa(i) + ".bin")
+	files, err := ioutil.ReadDir(contentDirectory)
+	if err != nil {
+		log.Fatal(err)
+	}
+	for _, f := range files {
+		data, err := ioutil.ReadFile(contentDirectory + "/" + f.Name())
 		if err != nil {
-			log.Printf("Failed to read file %s: %v", prefix+strconv.Itoa(i)+".bin", err)
-			continue
+			log.Printf("Failed to read file %s", f.Name())
+			return nil, err
 		}
 
 		fileData = append(fileData, FileData{
-			Name: prefix + strconv.Itoa(i) + ".bin",
+			Name: f.Name(),
 			Data: data,
 		})
 	}

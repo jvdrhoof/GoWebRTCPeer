@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -14,7 +15,9 @@ import (
 	"github.com/pion/interceptor/pkg/cc"
 	"github.com/pion/interceptor/pkg/gcc"
 	"github.com/pion/interceptor/pkg/nack"
+	"github.com/pion/interceptor/pkg/twcc"
 	"github.com/pion/rtp"
+	"github.com/pion/sdp/v3"
 	"github.com/pion/webrtc/v3"
 )
 
@@ -32,11 +35,16 @@ func main() {
 	answerAddr := flag.String("r", "127.0.0.1:8001", "Address that the Answer HTTP server is hosted on.")
 	useFiles := flag.Bool("f", false, "Use pre encoded files instead or remote input")
 	useVirtualWall := flag.Bool("v", false, "Use virtual wall ip filter")
+	useProxy := flag.Bool("p", false, "Use as a proxy")
+	flag.Parse()
+
+	println(useProxy)
+	contentDirectory := "content_jpg"
 
 	println(offerAddr, answerAddr, useFiles, useVirtualWall)
 
 	var transcoder Transcoder
-	transcoder = NewTranscoderFile()
+	transcoder = NewTranscoderFile(contentDirectory)
 	for !transcoder.IsReady() {
 		time.Sleep(10 * time.Millisecond)
 	}
@@ -57,12 +65,17 @@ func main() {
 		panic(err)
 	}
 
+	// Sender side
+
 	congestionController, err := cc.NewInterceptor(func() (cc.BandwidthEstimator, error) {
 		return gcc.NewSendSideBWE(gcc.SendSideBWEMinBitrate(75_000*8), gcc.SendSideBWEInitialBitrate(75_000_000), gcc.SendSideBWEMaxBitrate(262_744_320))
 	})
 	if err != nil {
 		panic(err)
 	}
+
+	m.RegisterFeedback(webrtc.RTCPFeedback{Type: "nack"}, webrtc.RTPCodecTypeVideo)
+	m.RegisterFeedback(webrtc.RTCPFeedback{Type: "nack", Parameter: "pli"}, webrtc.RTPCodecTypeVideo)
 
 	estimatorChan := make(chan cc.BandwidthEstimator, 1)
 	congestionController.OnNewPeerConnection(func(id string, estimator cc.BandwidthEstimator) {
@@ -75,9 +88,29 @@ func main() {
 	}
 
 	responder, _ := nack.NewResponderInterceptor()
-	m.RegisterFeedback(webrtc.RTCPFeedback{Type: "nack"}, webrtc.RTPCodecTypeVideo)
-	m.RegisterFeedback(webrtc.RTCPFeedback{Type: "nack", Parameter: "pli"}, webrtc.RTPCodecTypeVideo)
 	i.Add(responder)
+
+	// Client side
+
+	m.RegisterFeedback(webrtc.RTCPFeedback{Type: webrtc.TypeRTCPFBTransportCC}, webrtc.RTPCodecTypeVideo)
+	if err := m.RegisterHeaderExtension(webrtc.RTPHeaderExtensionCapability{URI: sdp.TransportCCURI}, webrtc.RTPCodecTypeVideo); err != nil {
+		panic(err)
+	}
+
+	m.RegisterFeedback(webrtc.RTCPFeedback{Type: webrtc.TypeRTCPFBTransportCC}, webrtc.RTPCodecTypeAudio)
+	if err := m.RegisterHeaderExtension(webrtc.RTPHeaderExtensionCapability{URI: sdp.TransportCCURI}, webrtc.RTPCodecTypeAudio); err != nil {
+		panic(err)
+	}
+
+	generator, err := twcc.NewSenderInterceptor(twcc.SendInterval(10 * time.Millisecond))
+	if err != nil {
+		panic(err)
+	}
+
+	i.Add(generator)
+
+	nackGenerator, _ := nack.NewGeneratorInterceptor()
+	i.Add(nackGenerator)
 
 	var candidatesMux sync.Mutex
 	pendingCandidates := make([]*webrtc.ICECandidate, 0)
@@ -88,6 +121,9 @@ func main() {
 			},
 		},
 	})
+	if err != nil {
+		panic(err)
+	}
 
 	videoTrack, err := NewTrackLocalCloudRTP(webrtc.RTPCodecCapability{"video/pcm", 90000, 0, "", nil}, "video", "pion")
 	if err != nil {
@@ -134,10 +170,62 @@ func main() {
 	})
 
 	peerConnection.OnConnectionStateChange(func(s webrtc.PeerConnectionState) {
-		fmt.Printf("Peer Connection State has changed: %s\n", s.String())
+		fmt.Printf("Peer connection state has changed: %s\n", s.String())
 		if s == webrtc.PeerConnectionStateFailed {
-			fmt.Println("Peer Connection has gone to failed exiting")
+			fmt.Println("Peer connection has gone to failed exiting")
 			os.Exit(0)
+		} else if s == webrtc.PeerConnectionStateConnected {
+			for ; true; <-time.NewTicker(20 * time.Millisecond).C {
+				targetBitrate := uint32(estimator.GetTargetBitrate())
+				transcoder.UpdateBitrate(targetBitrate)
+				if err = videoTrack.WriteFrame(transcoder); err != nil {
+					panic(err)
+				}
+			}
+		}
+	})
+
+	peerConnection.OnTrack(func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
+		println("TRACK")
+		println("Codec ", track.Codec().MimeType)
+		println("TYPE ", track.PayloadType())
+
+		codecName := strings.Split(track.Codec().RTPCodecCapability.MimeType, "/")
+		fmt.Printf("Track has started, of type %d: %s \n", track.PayloadType(), codecName)
+
+		// Create buffer to receive incoming track data, using 1300 bytes - header bytes
+		buf := make([]byte, 1220)
+
+		// Allows to check if frames are received completely
+		// Frame number and corresponding length
+		frames := make(map[uint32]uint32)
+		for {
+			_, _, readErr := track.Read(buf)
+			if readErr != nil {
+				panic(err)
+			}
+			/* if *useProxy {
+				// TODO: Use bufBinary and make plugin buffer size as parameter
+				buffProxy := make([]byte, 1300)
+				copy(buffProxy, buf[20:])
+				_, err = conn.WriteToUDP(buffProxy, addr)
+				if err != nil {
+					panic(err)
+				}
+			} */
+			// Create a buffer from the byte array, skipping the first 20 WebRTC bytes
+			// TODO: mention WebRTC header content explicitly
+			bufBinary := bytes.NewBuffer(buf[20:])
+			// Read the fields from the buffer into a struct
+			var p PointCloudPacket
+			err := binary.Read(bufBinary, binary.LittleEndian, &p)
+			if err != nil {
+				panic(err)
+			}
+			frames[p.FrameNr] += p.SeqLen
+			if frames[p.FrameNr] == p.FrameLen && p.FrameNr%100 == 0 {
+				println("FRAME COMPLETE ", p.FrameNr, p.FrameLen)
+			}
 		}
 	})
 
@@ -213,46 +301,6 @@ func main() {
 	wsHandler.StartListening(handleMessageCallback)
 	wsHandler.SendMessage(WebsocketPacket{1, 1, "Hello"})
 
-	select {}
-
-	oldEpochMilliseconds := time.Now().UnixNano() / int64(time.Millisecond)
-	println(estimator.GetTargetBitrate(), oldEpochMilliseconds)
-	msCounter := int(0)
-	tFrames := int(0)
-	loss := float64(0)
-	delayRate := int(0)
-	lossRate := int(0)
-	for ; true; <-time.NewTicker(20 * time.Millisecond).C {
-		tFrames++
-		epochMilliseconds := time.Now().UnixNano() / int64(time.Millisecond)
-		targetBitrate := uint32(estimator.GetTargetBitrate())
-		transcoder.UpdateBitrate(targetBitrate)
-		if err = videoTrack.WritePointCloud(transcoder); err != nil {
-			panic(err)
-		}
-		vLossRate, _ := estimator.GetStats()["lossTargetBitrate"]
-		vDelayRate, _ := estimator.GetStats()["delayTargetBitrate"]
-		vLoss, _ := estimator.GetStats()["averageLoss"]
-		lossRate += vLossRate.(int)
-		delayRate += vDelayRate.(int)
-		loss += vLoss.(float64)
-		msCounter += int(epochMilliseconds - oldEpochMilliseconds)
-		if uint64(msCounter/1000) > 0 {
-			println("MS ", msCounter)
-
-			avgLossRate := lossRate / tFrames
-			avgDelayRate := delayRate / tFrames
-			avgLoss := loss / float64(tFrames)
-			s := fmt.Sprintf("%.2f", avgLoss)
-			println(msCounter/tFrames, avgLossRate, avgDelayRate, s)
-			msCounter = msCounter - 1000
-			delayRate = 0
-			lossRate = 0
-			loss = 0.0
-			tFrames = 0
-		}
-		oldEpochMilliseconds = epochMilliseconds
-	}
 	// Block forever
 	select {}
 }
@@ -285,8 +333,6 @@ func (s *TrackLocalCloudRTP) Bind(t webrtc.TrackLocalContext) (webrtc.RTPCodecPa
 	if err != nil {
 		return codec, err
 	}
-	//s.rtpTrack.mu.Lock()
-	//defer s.rtpTrack.mu.Unlock()
 
 	// We only need one packetizer
 	if s.packetizer != nil {
@@ -321,7 +367,7 @@ func (s *TrackLocalCloudRTP) ID() string { return s.rtpTrack.ID() }
 // StreamID is the group this track belongs too. This must be unique
 func (s *TrackLocalCloudRTP) StreamID() string { return s.rtpTrack.StreamID() }
 
-// RID is the RTP stream identifier.
+// RID is the RTP stream identifier
 func (s *TrackLocalCloudRTP) RID() string { return s.rtpTrack.RID() }
 
 // Kind controls if this TrackLocal is audio or video
@@ -331,11 +377,10 @@ func (s *TrackLocalCloudRTP) Kind() webrtc.RTPCodecType { return s.rtpTrack.Kind
 func (s *TrackLocalCloudRTP) Codec() webrtc.RTPCodecCapability {
 	return s.rtpTrack.Codec()
 }
-func (s *TrackLocalCloudRTP) WritePointCloud(t Transcoder) error {
-	//s.rtpTrack.mu.RLock()
+
+func (s *TrackLocalCloudRTP) WriteFrame(t Transcoder) error {
 	p := s.packetizer
 	clockRate := s.clockRate
-	//s.rtpTrack.mu.RUnlock()
 
 	if p == nil {
 		return nil
@@ -343,21 +388,19 @@ func (s *TrackLocalCloudRTP) WritePointCloud(t Transcoder) error {
 
 	samples := uint32(1 * clockRate)
 	frameData := t.EncodeFrame()
-	//emptyByteArray := make([]byte, 50_000)
 	packets := p.Packetize(frameData.Data, samples)
 
 	writeErrs := []error{}
 	counter := 0
 	for _, p := range packets {
-
 		if err := s.rtpTrack.WriteRTP(p); err != nil {
 			writeErrs = append(writeErrs, err)
-
 		}
 		counter += 1
 	}
 	return nil
 }
+
 func smallWait() {
 	for start := time.Now().UnixNano(); time.Now().UnixNano() >= start+5000; {
 	}
