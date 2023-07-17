@@ -5,11 +5,11 @@
         {
             "label": "Build peer",
             "command": [
-                "go build -o ../../peer.exe"
+                "go build -o ../peer.exe"
             ],
             "group": "build",
             "options": {
-                "cwd": "${workspaceFolder}/cmd/peer"
+                "cwd": "${workspaceFolder}/peer"
             }
         }
     ],
