@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"net"
 	"os"
 	"strings"
 	"sync"
@@ -23,11 +24,11 @@ import (
 
 const (
 	Idle     int = 0
-	Hello        = 1
-	Offer        = 2
-	Answer       = 3
-	Ready        = 4
-	Finished     = 5
+	Hello    int = 1
+	Offer    int = 2
+	Answer   int = 3
+	Ready    int = 4
+	Finished int = 5
 )
 
 func main() {
@@ -43,10 +44,53 @@ func main() {
 
 	println(offerAddr, answerAddr, useFiles, useVirtualWall)
 
-	var transcoder Transcoder
-	transcoder = NewTranscoderFile(contentDirectory)
+	var transcoder = NewTranscoderFile(contentDirectory)
 	for !transcoder.IsReady() {
 		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Proxy logic
+
+	var addr *net.UDPAddr
+	var conn *net.UDPConn
+
+	// If a proxy is used, incoming packets should be forwarded
+	if *useProxy {
+		// Get the current address
+		address, err := net.ResolveUDPAddr("udp", ":8000")
+		if err != nil {
+			fmt.Println("Error resolving address:", err)
+			return
+		}
+
+		// Create a UDP connection
+		conn, err = net.ListenUDP("udp", address)
+		if err != nil {
+			fmt.Println("Error listening:", err)
+			return
+		}
+
+		// Defer function, executed once the main is completed
+		defer func() {
+			println("Closing connection")
+			conn.Close()
+		}()
+
+		// Create a buffer to read incoming messages
+		buffer := make([]byte, 1500)
+
+		// Wait for incoming messages
+		fmt.Println("Waiting for a message...")
+
+		var n int
+		n, addr, err = conn.ReadFromUDP(buffer)
+		if err != nil {
+			fmt.Println("Error reading:", err)
+			return
+		}
+
+		// Print the received message
+		fmt.Println("Received message:", string(buffer[:n]))
 	}
 
 	settingEngine := webrtc.SettingEngine{}
@@ -57,9 +101,23 @@ func main() {
 	if err := m.RegisterDefaultCodecs(); err != nil {
 		panic(err)
 	}
-	videoRTCPFeedback := []webrtc.RTCPFeedback{{"goog-remb", ""}, {"ccm", "fir"}, {"nack", ""}, {"nack", "pli"}}
+	videoRTCPFeedback := []webrtc.RTCPFeedback{
+		{Type: "goog-remb", Parameter: ""},
+		{Type: "ccm", Parameter: "fir"},
+		{Type: "nack", Parameter: ""},
+		{Type: "nack", Parameter: "pli"},
+	}
+
+	codecCapability := webrtc.RTPCodecCapability{
+		MimeType:     "video/pcm",
+		ClockRate:    90000,
+		Channels:     0,
+		SDPFmtpLine:  "",
+		RTCPFeedback: videoRTCPFeedback,
+	}
+
 	if err := m.RegisterCodec(webrtc.RTPCodecParameters{
-		RTPCodecCapability: webrtc.RTPCodecCapability{"video/pcm", 90000, 0, "", videoRTCPFeedback},
+		RTPCodecCapability: codecCapability,
 		PayloadType:        5,
 	}, webrtc.RTPCodecTypeVideo); err != nil {
 		panic(err)
@@ -125,7 +183,15 @@ func main() {
 		panic(err)
 	}
 
-	videoTrack, err := NewTrackLocalCloudRTP(webrtc.RTPCodecCapability{"video/pcm", 90000, 0, "", nil}, "video", "pion")
+	codecCapability = webrtc.RTPCodecCapability{
+		MimeType:     "video/pcm",
+		ClockRate:    90000,
+		Channels:     0,
+		SDPFmtpLine:  "",
+		RTCPFeedback: nil,
+	}
+
+	videoTrack, err := NewTrackLocalCloudRTP(codecCapability, "video", "pion")
 	if err != nil {
 		panic(err)
 	}
@@ -186,12 +252,12 @@ func main() {
 	})
 
 	peerConnection.OnTrack(func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
-		println("TRACK")
-		println("Codec ", track.Codec().MimeType)
-		println("TYPE ", track.PayloadType())
+		println("OnTrack has been called")
+		println("MIME type:", track.Codec().MimeType)
+		println("Payload type:", track.PayloadType())
 
 		codecName := strings.Split(track.Codec().RTPCodecCapability.MimeType, "/")
-		fmt.Printf("Track has started, of type %d: %s \n", track.PayloadType(), codecName)
+		fmt.Printf("Track of type %d has started: %s \n", track.PayloadType(), codecName)
 
 		// Create buffer to receive incoming track data, using 1300 bytes - header bytes
 		buf := make([]byte, 1220)
@@ -204,7 +270,9 @@ func main() {
 			if readErr != nil {
 				panic(err)
 			}
-			/* if *useProxy {
+
+			// Proxy logic
+			if *useProxy {
 				// TODO: Use bufBinary and make plugin buffer size as parameter
 				buffProxy := make([]byte, 1300)
 				copy(buffProxy, buf[20:])
@@ -212,12 +280,13 @@ func main() {
 				if err != nil {
 					panic(err)
 				}
-			} */
+			}
+
 			// Create a buffer from the byte array, skipping the first 20 WebRTC bytes
 			// TODO: mention WebRTC header content explicitly
 			bufBinary := bytes.NewBuffer(buf[20:])
 			// Read the fields from the buffer into a struct
-			var p PointCloudPacket
+			var p FramePacket
 			err := binary.Read(bufBinary, binary.LittleEndian, &p)
 			if err != nil {
 				panic(err)
@@ -398,12 +467,8 @@ func (s *TrackLocalCloudRTP) WriteFrame(t Transcoder) error {
 		}
 		counter += 1
 	}
+	println(writeErrs)
 	return nil
-}
-
-func smallWait() {
-	for start := time.Now().UnixNano(); time.Now().UnixNano() >= start+5000; {
-	}
 }
 
 // AV1Payloader payloads AV1 packets
@@ -422,7 +487,7 @@ func (p *PointCloudPayloader) Payload(mtu uint16, payload []byte) (payloads [][]
 		if payloadRemaining < currentFragmentSize {
 			currentFragmentSize = payloadRemaining
 		}
-		p := NewPointCloudPacket(p.frameCounter, payloadLen, currentFragmentSize, payloadDataOffset, payload)
+		p := NewFramePacket(p.frameCounter, payloadLen, currentFragmentSize, payloadDataOffset, payload)
 		buf := new(bytes.Buffer)
 
 		if err := binary.Write(buf, binary.LittleEndian, p); err != nil {
