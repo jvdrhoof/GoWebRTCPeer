@@ -30,21 +30,40 @@ const (
 	Finished     = 5
 )
 
+var proxy_conn *ProxyConnection
+
 func main() {
 	offerAddr := flag.String("offer-address", ":7002", "Address that the Offer HTTP server is hosted on.")
 	answerAddr := flag.String("r", "127.0.0.1:8001", "Address that the Answer HTTP server is hosted on.")
 	useFiles := flag.Bool("f", false, "Use pre encoded files instead or remote input")
 	useVirtualWall := flag.Bool("v", false, "Use virtual wall ip filter")
-	useProxy := flag.Bool("p", false, "Use as a proxy")
+	proxyPort := flag.String("p", ":0", "Use as a proxy with specified port")
+	useProxyInput := flag.Bool("i", false, "Use proxy as input for the frames")
+	useProxyOutput := flag.Bool("o", false, "Send the frames to the proxy")
 	flag.Parse()
+	useProxy := false
+	if *proxyPort != ":0" {
+		proxy_conn = NewProxyConnection()
+		fmt.Println(*proxyPort)
+		proxy_conn.SetupConnection(*proxyPort)
+		useProxy = true
+		// TODO maybe move this
+		if *useProxyInput {
+			proxy_conn.StartListening()
+		}
 
-	println(useProxy)
+	}
 	contentDirectory := "content_jpg"
 
 	println(offerAddr, answerAddr, useFiles, useVirtualWall)
 
 	var transcoder Transcoder
-	transcoder = NewTranscoderFile(contentDirectory)
+	if !*useProxyInput {
+		transcoder = NewTranscoderFile(contentDirectory)
+	} else {
+		transcoder = NewTranscoderRemote(proxy_conn)
+	}
+
 	for !transcoder.IsReady() {
 		time.Sleep(10 * time.Millisecond)
 	}
@@ -204,15 +223,10 @@ func main() {
 			if readErr != nil {
 				panic(err)
 			}
-			/* if *useProxy {
+			if useProxy && *useProxyOutput {
 				// TODO: Use bufBinary and make plugin buffer size as parameter
-				buffProxy := make([]byte, 1300)
-				copy(buffProxy, buf[20:])
-				_, err = conn.WriteToUDP(buffProxy, addr)
-				if err != nil {
-					panic(err)
-				}
-			} */
+				proxy_conn.SendFramePacket(buf, 20)
+			}
 			// Create a buffer from the byte array, skipping the first 20 WebRTC bytes
 			// TODO: mention WebRTC header content explicitly
 			bufBinary := bytes.NewBuffer(buf[20:])
