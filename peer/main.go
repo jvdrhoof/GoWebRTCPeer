@@ -37,14 +37,12 @@ func main() {
 	useFiles := flag.Bool("f", false, "Use pre encoded files instead or remote input")
 	useVirtualWall := flag.Bool("v", false, "Use virtual wall ip filter")
 	useProxy := flag.Bool("p", false, "Use as a proxy")
+	contentDirectory := flag.String("d", "content_jpg", "Content directory")
 	flag.Parse()
 
-	println(useProxy)
-	contentDirectory := "content_jpg"
+	println(*offerAddr, *answerAddr, *useFiles, *useVirtualWall, *useProxy, *contentDirectory)
 
-	println(offerAddr, answerAddr, useFiles, useVirtualWall)
-
-	var transcoder = NewTranscoderFile(contentDirectory)
+	var transcoder = NewTranscoderFile(*contentDirectory)
 	for !transcoder.IsReady() {
 		time.Sleep(10 * time.Millisecond)
 	}
@@ -299,7 +297,7 @@ func main() {
 	})
 
 	var state = Idle
-	print(state)
+	println("Current state:", state)
 
 	var handleMessageCallback = func(wsPacket WebsocketPacket) {
 		switch wsPacket.MessageType {
@@ -318,6 +316,7 @@ func main() {
 			}
 			wsHandler.SendMessage(WebsocketPacket{1, 2, string(payload)})
 			state = Hello
+			println("Current state:", state)
 		case 2: // offer
 			println("Received offer")
 			offer := webrtc.SessionDescription{}
@@ -339,6 +338,7 @@ func main() {
 			}
 			wsHandler.SendMessage(WebsocketPacket{1, 3, string(payload)})
 			state = Offer
+			println("Current state:", state)
 		case 3: // answer
 			println("Received answer")
 			answer := webrtc.SessionDescription{}
@@ -356,6 +356,7 @@ func main() {
 			}
 			candidatesMux.Unlock()
 			state = Answer
+			println("Current state:", state)
 		case 4: // candidate
 			println("Received candidate")
 			candidate := wsPacket.Message
@@ -467,7 +468,9 @@ func (s *TrackLocalCloudRTP) WriteFrame(t Transcoder) error {
 		}
 		counter += 1
 	}
-	println(writeErrs)
+	if len(writeErrs) > 0 {
+		println(writeErrs)
+	}
 	return nil
 }
 

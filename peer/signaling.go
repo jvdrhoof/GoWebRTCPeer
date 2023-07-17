@@ -42,7 +42,6 @@ func (w *WebsocketHandler) StartListening(cb WebsocketCallback) {
 			clientID, _ := strconv.ParseUint(v[0], 10, 64)
 			messageType, _ := strconv.ParseUint(v[1], 10, 64)
 			wsPacket := WebsocketPacket{clientID, messageType, v[2]}
-			println("Received:", wsPacket.Message)
 			cb(wsPacket)
 		}
 	}()
