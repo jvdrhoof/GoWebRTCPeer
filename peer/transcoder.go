@@ -70,7 +70,7 @@ func NewTranscoderRemote(proxy_con *ProxyConnection) *TranscoderRemote {
 }
 
 func (t *TranscoderRemote) UpdateBitrate(bitrate uint32) {
-	// fmt.Printf("A bitrate of %d would have been better\n", bitrate)
+	// Do nothing
 }
 
 func (t *TranscoderRemote) UpdateProjection() {
@@ -78,7 +78,7 @@ func (t *TranscoderRemote) UpdateProjection() {
 }
 
 func (t *TranscoderRemote) EncodeFrame() *Frame {
-	data := proxy_conn.NextFrame()
+	data := proxyConn.NextFrame()
 	rFrame := Frame{0, uint32(len(data)), t.frameCounter, data}
 	t.frameCounter++
 	return &rFrame

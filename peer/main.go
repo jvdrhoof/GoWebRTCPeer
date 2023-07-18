@@ -30,7 +30,7 @@ const (
 	Finished int = 5
 )
 
-var proxy_conn *ProxyConnection
+var proxyConn *ProxyConnection
 
 func main() {
 	offerAddr := flag.String("offer-address", ":7002", "Address that the Offer HTTP server is hosted on.")
@@ -44,13 +44,13 @@ func main() {
 	flag.Parse()
 	useProxy := false
 	if *proxyPort != ":0" {
-		proxy_conn = NewProxyConnection()
+		proxyConn = NewProxyConnection()
 		fmt.Println(*proxyPort)
-		proxy_conn.SetupConnection(*proxyPort)
+		proxyConn.SetupConnection(*proxyPort)
 		useProxy = true
 		// TODO maybe move this
 		if *useProxyInput {
-			proxy_conn.StartListening()
+			proxyConn.StartListening()
 		}
 
 	}
@@ -60,7 +60,7 @@ func main() {
 	if !*useProxyInput {
 		transcoder = NewTranscoderFile(*contentDirectory)
 	} else {
-		transcoder = NewTranscoderRemote(proxy_conn)
+		transcoder = NewTranscoderRemote(proxyConn)
 	}
 
 	for !transcoder.IsReady() {
@@ -246,7 +246,7 @@ func main() {
 			}
 			if useProxy && *useProxyOutput {
 				// TODO: Use bufBinary and make plugin buffer size as parameter
-				proxy_conn.SendFramePacket(buf, 20)
+				proxyConn.SendFramePacket(buf, 20)
 			}
 			// Create a buffer from the byte array, skipping the first 20 WebRTC bytes
 			// TODO: mention WebRTC header content explicitly
