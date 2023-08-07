@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -41,26 +42,36 @@ func main() {
 	useProxyInput := flag.Bool("i", false, "Use proxy as input for the frames")
 	useProxyOutput := flag.Bool("o", false, "Send the frames to the proxy")
 	contentDirectory := flag.String("d", "content_jpg", "Content directory")
+	doNotSendData := flag.Bool("n", false, "Do not send data")
 	flag.Parse()
 	useProxy := false
+	numberOfTiles := 1
+
 	if *proxyPort != ":0" {
 		proxyConn = NewProxyConnection()
 		fmt.Println(*proxyPort)
-		proxyConn.SetupConnection(*proxyPort)
+
+		var handleSetupCallback = func(NumberOfTiles int) {
+			fmt.Println("Number of tiles equals ", NumberOfTiles)
+			numberOfTiles = NumberOfTiles
+		}
+
+		proxyConn.SetupConnection(*proxyPort, handleSetupCallback)
 		useProxy = true
 		// TODO maybe move this
 		if *useProxyInput {
 			proxyConn.StartListening()
 		}
-
 	}
 
 	println(*offerAddr, *answerAddr, *useFiles, *useVirtualWall, *useProxyInput, *useProxyOutput, *contentDirectory)
 	var transcoder Transcoder
-	if !*useProxyInput {
+	if !*useProxyInput && !*doNotSendData {
 		transcoder = NewTranscoderFile(*contentDirectory)
-	} else {
+	} else if *useProxyInput {
 		transcoder = NewTranscoderRemote(proxyConn)
+	} else {
+		transcoder = NewTranscoderDummy(proxyConn)
 	}
 
 	for !transcoder.IsReady() {
@@ -165,15 +176,33 @@ func main() {
 		RTCPFeedback: nil,
 	}
 
-	videoTrack, err := NewTrackLocalCloudRTP(codecCapability, "video", "pion")
-	if err != nil {
-		panic(err)
+	videoTracks := map[int]*TrackLocalCloudRTP{}
+
+	for i := 0; i < numberOfTiles; i++ {
+		videoTrack, err := NewTrackLocalCloudRTP(codecCapability, fmt.Sprintf("video_%d", i), fmt.Sprintf("%d", i))
+		if err != nil {
+			panic(err)
+		}
+		videoTracks[i] = videoTrack
 	}
 
-	// RTP Sender
-	rtpSender, err := peerConnection.AddTrack(videoTrack)
-	if err != nil {
-		panic(err)
+	for i := 0; i < numberOfTiles; i++ {
+		if _, err = peerConnection.AddTrack(videoTracks[i]); err != nil {
+			panic(err)
+		}
+	}
+
+	processRTCP := func(rtpSender *webrtc.RTPSender) {
+		rtcpBuf := make([]byte, 1500)
+		for {
+			if _, _, rtcpErr := rtpSender.Read(rtcpBuf); rtcpErr != nil {
+				return
+			}
+		}
+	}
+
+	for _, rtpSender := range peerConnection.GetSenders() {
+		go processRTCP(rtpSender)
 	}
 
 	defer func() {
@@ -183,14 +212,6 @@ func main() {
 	}()
 
 	estimator := <-estimatorChan
-	go func() {
-		rtcpBuf := make([]byte, 1500)
-		for {
-			if _, _, err := rtpSender.Read(rtcpBuf); err != nil {
-				panic(err)
-			}
-		}
-	}()
 
 	wsHandler := NewWSHandler("193.190.127.152:8000")
 
@@ -218,8 +239,11 @@ func main() {
 			for ; true; <-time.NewTicker(20 * time.Millisecond).C {
 				targetBitrate := uint32(estimator.GetTargetBitrate())
 				transcoder.UpdateBitrate(targetBitrate)
-				if err = videoTrack.WriteFrame(transcoder); err != nil {
-					panic(err)
+
+				for i := 0; i < numberOfTiles; i++ {
+					if err = videoTracks[i].WriteFrame(transcoder, uint32(i)); err != nil {
+						panic(err)
+					}
 				}
 			}
 		}
@@ -231,7 +255,7 @@ func main() {
 		println("Payload type:", track.PayloadType())
 
 		codecName := strings.Split(track.Codec().RTPCodecCapability.MimeType, "/")
-		fmt.Printf("Track of type %d has started: %s \n", track.PayloadType(), codecName)
+		fmt.Printf("Track of type %d has started: %s\n", track.PayloadType(), codecName)
 
 		// Create buffer to receive incoming track data, using 1300 bytes - header bytes
 		buf := make([]byte, 1220)
@@ -244,9 +268,22 @@ func main() {
 			if readErr != nil {
 				panic(err)
 			}
+
+			/*
+				var y RemoteInputPacketHeader
+				e := binary.Read(bytes.NewBuffer((buf[20:40])), binary.LittleEndian, &y)
+				if e != nil {
+					fmt.Println("Error:", e)
+					fmt.Println("QUITING")
+					return
+				}
+				fmt.Println("Packet ", y.Framenr, y.Tilenr, y.Tilelen, y.Frameoffset, y.Packetlen)
+			*/
+
 			if useProxy && *useProxyOutput {
 				// TODO: Use bufBinary and make plugin buffer size as parameter
-				proxyConn.SendFramePacket(buf, 20)
+				// proxyConn.SendFramePacket(buf, 20)
+				proxyConn.SendTilePacket(buf, 20)
 			}
 			// Create a buffer from the byte array, skipping the first 20 WebRTC bytes
 			// TODO: mention WebRTC header content explicitly
@@ -258,8 +295,8 @@ func main() {
 				panic(err)
 			}
 			frames[p.FrameNr] += p.SeqLen
-			if frames[p.FrameNr] == p.FrameLen && p.FrameNr%100 == 0 {
-				println("FRAME COMPLETE ", p.FrameNr, p.FrameLen)
+			if frames[p.FrameNr] == p.TileLen && p.FrameNr%100 == 0 {
+				println("FRAME COMPLETE ", p.FrameNr, p.TileLen)
 			}
 		}
 	})
@@ -378,11 +415,15 @@ func (s *TrackLocalCloudRTP) Bind(t webrtc.TrackLocalContext) (webrtc.RTPCodecPa
 	}
 
 	s.sequencer = rtp.NewRandomSequencer()
+	ui64, err := strconv.ParseUint(s.StreamID(), 10, 64)
+	if err != nil {
+		panic(err)
+	}
 	s.packetizer = rtp.NewPacketizer(
 		1200, // Not MTU but ok
 		0,    // Value is handled when writing
 		0,    // Value is handled when writing
-		NewPointCloudPayloader(),
+		NewPointCloudPayloader(uint32(ui64)),
 		s.sequencer,
 		codec.ClockRate,
 	)
@@ -416,7 +457,7 @@ func (s *TrackLocalCloudRTP) Codec() webrtc.RTPCodecCapability {
 	return s.rtpTrack.Codec()
 }
 
-func (s *TrackLocalCloudRTP) WriteFrame(t Transcoder) error {
+func (s *TrackLocalCloudRTP) WriteFrame(t Transcoder, tile uint32) error {
 	p := s.packetizer
 	clockRate := s.clockRate
 
@@ -425,19 +466,20 @@ func (s *TrackLocalCloudRTP) WriteFrame(t Transcoder) error {
 	}
 
 	samples := uint32(1 * clockRate)
-	frameData := t.EncodeFrame()
-	packets := p.Packetize(frameData.Data, samples)
-
-	writeErrs := []error{}
-	counter := 0
-	for _, p := range packets {
-		if err := s.rtpTrack.WriteRTP(p); err != nil {
-			writeErrs = append(writeErrs, err)
+	frameData := t.EncodeFrame(tile)
+	if frameData != nil {
+		packets := p.Packetize(frameData.Data, samples)
+		writeErrs := []error{}
+		counter := 0
+		for _, p := range packets {
+			if err := s.rtpTrack.WriteRTP(p); err != nil {
+				writeErrs = append(writeErrs, err)
+			}
+			counter += 1
 		}
-		counter += 1
-	}
-	if len(writeErrs) > 0 {
-		println(writeErrs)
+		if len(writeErrs) > 0 {
+			println(writeErrs)
+		}
 	}
 	return nil
 }
@@ -445,6 +487,7 @@ func (s *TrackLocalCloudRTP) WriteFrame(t Transcoder) error {
 // AV1Payloader payloads AV1 packets
 type PointCloudPayloader struct {
 	frameCounter uint32
+	tile         uint32
 }
 
 // Payload fragments a AV1 packet across one or more byte arrays
@@ -454,11 +497,11 @@ func (p *PointCloudPayloader) Payload(mtu uint16, payload []byte) (payloads [][]
 	payloadLen := uint32(len(payload))
 	payloadRemaining := payloadLen
 	for payloadRemaining > 0 {
-		currentFragmentSize := uint32(1180)
+		currentFragmentSize := uint32(1148)
 		if payloadRemaining < currentFragmentSize {
 			currentFragmentSize = payloadRemaining
 		}
-		p := NewFramePacket(p.frameCounter, payloadLen, currentFragmentSize, payloadDataOffset, payload)
+		p := NewFramePacket(p.frameCounter, p.tile, payloadLen, payloadDataOffset, currentFragmentSize, payload)
 		buf := new(bytes.Buffer)
 
 		if err := binary.Write(buf, binary.LittleEndian, p); err != nil {
@@ -469,9 +512,21 @@ func (p *PointCloudPayloader) Payload(mtu uint16, payload []byte) (payloads [][]
 		payloadRemaining -= currentFragmentSize
 	}
 	p.frameCounter++
+	/*
+		for index, element := range payloads {
+			var y RemoteInputPacketHeader
+			err := binary.Read(bytes.NewBuffer((element[:20])), binary.LittleEndian, &y)
+			if err != nil {
+				fmt.Println("Error:", err)
+				fmt.Println("QUITING")
+				return
+			}
+			fmt.Println("Packet ", index, y.Framenr, y.Tilenr, y.Packetlen, y.Frameoffset, y.Tilelen)
+		}
+	*/
 	return payloads
 }
 
-func NewPointCloudPayloader() *PointCloudPayloader {
-	return &PointCloudPayloader{0}
+func NewPointCloudPayloader(tile uint32) *PointCloudPayloader {
+	return &PointCloudPayloader{0, tile}
 }
