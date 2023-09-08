@@ -32,50 +32,31 @@ const (
 )
 
 var proxyConn *ProxyConnection
+var clientID *int
 
 func main() {
-	offerAddr := flag.String("offer-address", ":7002", "Address that the Offer HTTP server is hosted on.")
-	answerAddr := flag.String("r", "127.0.0.1:8001", "Address that the Answer HTTP server is hosted on.")
-	useFiles := flag.Bool("f", false, "Use pre encoded files instead or remote input")
-	useVirtualWall := flag.Bool("v", false, "Use virtual wall ip filter")
-	proxyPort := flag.String("p", ":0", "Use as a proxy with specified port")
-	useProxyInput := flag.Bool("i", false, "Use proxy as input for the frames")
-	useProxyOutput := flag.Bool("o", false, "Send the frames to the proxy")
-	contentDirectory := flag.String("d", "content_jpg", "Content directory")
-	doNotSendData := flag.Bool("n", false, "Do not send data")
+	proxyPort := flag.String("p", ":0", "Port through which the DLL is connected")
+	useProxyInput := flag.Bool("i", false, "Receive content from the DLL to forward over WebRTC")
+	useProxyOutput := flag.Bool("o", false, "Forward content received over WebRTC to the DLL")
+	clientID = flag.Int("c", 0, "Client ID")
+	numberOfTiles := flag.Int("t", 1, "Number of tiles")
 	flag.Parse()
-	useProxy := false
-	numberOfTiles := 1
 
-	if *proxyPort != ":0" {
-		proxyConn = NewProxyConnection()
-		fmt.Println(*proxyPort)
-
-		var handleSetupCallback = func(NumberOfTiles int) {
-			fmt.Println("Number of tiles equals ", NumberOfTiles)
-			numberOfTiles = NumberOfTiles
-		}
-
-		proxyConn.SetupConnection(*proxyPort, handleSetupCallback)
-		useProxy = true
-		// TODO maybe move this
-		if *useProxyInput {
-			proxyConn.StartListening()
-		}
+	if *proxyPort == ":0" {
+		fmt.Println("WebRTCPeer: ERROR: port cannot equal :0")
+		os.Exit(1)
 	}
 
-	println(*offerAddr, *answerAddr, *useFiles, *useVirtualWall, *useProxyInput, *useProxyOutput, *contentDirectory)
+	fmt.Printf("WebRTCPeer: Starting client %d\n", *clientID)
+
+	proxyConn = NewProxyConnection()
+	proxyConn.SetupConnection(*proxyPort)
 	var transcoder Transcoder
-	if !*useProxyInput && !*doNotSendData {
-		transcoder = NewTranscoderFile(*contentDirectory)
-	} else if *useProxyInput {
+	if *useProxyInput {
+		proxyConn.StartListening()
 		transcoder = NewTranscoderRemote(proxyConn)
 	} else {
 		transcoder = NewTranscoderDummy(proxyConn)
-	}
-
-	for !transcoder.IsReady() {
-		time.Sleep(10 * time.Millisecond)
 	}
 
 	settingEngine := webrtc.SettingEngine{}
@@ -108,8 +89,6 @@ func main() {
 		panic(err)
 	}
 
-	// Sender side
-
 	congestionController, err := cc.NewInterceptor(func() (cc.BandwidthEstimator, error) {
 		return gcc.NewSendSideBWE(gcc.SendSideBWEMinBitrate(75_000*8), gcc.SendSideBWEInitialBitrate(75_000_000), gcc.SendSideBWEMaxBitrate(262_744_320))
 	})
@@ -132,8 +111,6 @@ func main() {
 
 	responder, _ := nack.NewResponderInterceptor()
 	i.Add(responder)
-
-	// Client side
 
 	m.RegisterFeedback(webrtc.RTCPFeedback{Type: webrtc.TypeRTCPFBTransportCC}, webrtc.RTPCodecTypeVideo)
 	if err := m.RegisterHeaderExtension(webrtc.RTPHeaderExtensionCapability{URI: sdp.TransportCCURI}, webrtc.RTPCodecTypeVideo); err != nil {
@@ -178,7 +155,7 @@ func main() {
 
 	videoTracks := map[int]*TrackLocalCloudRTP{}
 
-	for i := 0; i < numberOfTiles; i++ {
+	for i := 0; i < *numberOfTiles; i++ {
 		videoTrack, err := NewTrackLocalCloudRTP(codecCapability, fmt.Sprintf("video_%d", i), fmt.Sprintf("%d", i))
 		if err != nil {
 			panic(err)
@@ -186,7 +163,7 @@ func main() {
 		videoTracks[i] = videoTrack
 	}
 
-	for i := 0; i < numberOfTiles; i++ {
+	for i := 0; i < *numberOfTiles; i++ {
 		if _, err = peerConnection.AddTrack(videoTracks[i]); err != nil {
 			panic(err)
 		}
@@ -207,7 +184,7 @@ func main() {
 
 	defer func() {
 		if cErr := peerConnection.Close(); cErr != nil {
-			fmt.Printf("Cannot close peer connection: %v\n", cErr)
+			fmt.Printf("WebRTCPeer: Cannot close peer connection: %v\n", cErr)
 		}
 	}()
 
@@ -225,22 +202,21 @@ func main() {
 			pendingCandidates = append(pendingCandidates, c)
 		} else {
 			payload := []byte(c.ToJSON().Candidate)
-			wsHandler.SendMessage(WebsocketPacket{1, 4, string(payload)})
+			wsHandler.SendMessage(WebsocketPacket{uint64(*clientID), 4, string(payload)})
 		}
 		candidatesMux.Unlock()
 	})
 
 	peerConnection.OnConnectionStateChange(func(s webrtc.PeerConnectionState) {
-		fmt.Printf("Peer connection state has changed: %s\n", s.String())
+		fmt.Printf("WebRTCPeer: Peer connection state has changed: %s\n", s.String())
 		if s == webrtc.PeerConnectionStateFailed {
-			fmt.Println("Peer connection has gone to failed exiting")
+			fmt.Println("WebRTCPeer: Peer connection failed, exiting")
 			os.Exit(0)
 		} else if s == webrtc.PeerConnectionStateConnected {
-			for ; true; <-time.NewTicker(20 * time.Millisecond).C {
+			for ; true; <-time.NewTicker(30 * time.Millisecond).C {
 				targetBitrate := uint32(estimator.GetTargetBitrate())
 				transcoder.UpdateBitrate(targetBitrate)
-
-				for i := 0; i < numberOfTiles; i++ {
+				for i := 0; i < *numberOfTiles; i++ {
 					if err = videoTracks[i].WriteFrame(transcoder, uint32(i)); err != nil {
 						panic(err)
 					}
@@ -250,43 +226,26 @@ func main() {
 	})
 
 	peerConnection.OnTrack(func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
-		println("OnTrack has been called")
-		println("MIME type:", track.Codec().MimeType)
-		println("Payload type:", track.PayloadType())
+		fmt.Printf("WebRTCPeer: MIME type %s\n", track.Codec().MimeType)
+		fmt.Printf("WebRTCPeer: Payload type %d\n", track.PayloadType())
 
 		codecName := strings.Split(track.Codec().RTPCodecCapability.MimeType, "/")
-		fmt.Printf("Track of type %d has started: %s\n", track.PayloadType(), codecName)
+		fmt.Printf("WebRTCPeer: Track of type %d has started: %s\n", track.PayloadType(), codecName)
 
 		// Create buffer to receive incoming track data, using 1300 bytes - header bytes
 		buf := make([]byte, 1220)
 
 		// Allows to check if frames are received completely
-		// Frame number and corresponding length
 		frames := make(map[uint32]uint32)
 		for {
 			_, _, readErr := track.Read(buf)
 			if readErr != nil {
 				panic(err)
 			}
-
-			/*
-				var y RemoteInputPacketHeader
-				e := binary.Read(bytes.NewBuffer((buf[20:40])), binary.LittleEndian, &y)
-				if e != nil {
-					fmt.Println("Error:", e)
-					fmt.Println("QUITING")
-					return
-				}
-				fmt.Println("Packet ", y.Framenr, y.Tilenr, y.Tilelen, y.Frameoffset, y.Packetlen)
-			*/
-
-			if useProxy && *useProxyOutput {
-				// TODO: Use bufBinary and make plugin buffer size as parameter
-				// proxyConn.SendFramePacket(buf, 20)
+			if *useProxyOutput {
 				proxyConn.SendTilePacket(buf, 20)
 			}
 			// Create a buffer from the byte array, skipping the first 20 WebRTC bytes
-			// TODO: mention WebRTC header content explicitly
 			bufBinary := bytes.NewBuffer(buf[20:])
 			// Read the fields from the buffer into a struct
 			var p FramePacket
@@ -295,19 +254,20 @@ func main() {
 				panic(err)
 			}
 			frames[p.FrameNr] += p.SeqLen
-			if frames[p.FrameNr] == p.TileLen && p.FrameNr%100 == 0 {
-				println("FRAME COMPLETE ", p.FrameNr, p.TileLen)
+			if frames[p.FrameNr] == p.TileLen {
+				fmt.Printf("WebRTCPeer: Received frame %d from client %d and tile %d with length %d\n",
+					p.FrameNr, p.ClientNr, p.TileNr, p.TileLen)
 			}
 		}
 	})
 
 	var state = Idle
-	println("Current state:", state)
+	fmt.Printf("WebRTCPeer: Current state: %d\n", state)
 
 	var handleMessageCallback = func(wsPacket WebsocketPacket) {
 		switch wsPacket.MessageType {
 		case 1: // hello
-			println("Received hello")
+			fmt.Println("WebRTCPeer: Received hello")
 			offer, err := peerConnection.CreateOffer(nil)
 			if err != nil {
 				panic(err)
@@ -319,11 +279,11 @@ func main() {
 			if err != nil {
 				panic(err)
 			}
-			wsHandler.SendMessage(WebsocketPacket{1, 2, string(payload)})
+			wsHandler.SendMessage(WebsocketPacket{uint64(*clientID), 2, string(payload)})
 			state = Hello
-			println("Current state:", state)
+			fmt.Printf("WebRTCPeer: Current state: %d\n", state)
 		case 2: // offer
-			println("Received offer")
+			fmt.Println("WebRTCPeer: Received offer")
 			offer := webrtc.SessionDescription{}
 			err := json.Unmarshal([]byte(wsPacket.Message), &offer)
 			if err != nil {
@@ -341,11 +301,11 @@ func main() {
 			if err != nil {
 				panic(err)
 			}
-			wsHandler.SendMessage(WebsocketPacket{1, 3, string(payload)})
+			wsHandler.SendMessage(WebsocketPacket{uint64(*clientID), 3, string(payload)})
 			state = Offer
-			println("Current state:", state)
+			fmt.Printf("WebRTCPeer: Current state: %d\n", state)
 		case 3: // answer
-			println("Received answer")
+			fmt.Println("WebRTCPeer: Received answer")
 			answer := webrtc.SessionDescription{}
 			err := json.Unmarshal([]byte(wsPacket.Message), &answer)
 			if err != nil {
@@ -357,24 +317,24 @@ func main() {
 			candidatesMux.Lock()
 			for _, c := range pendingCandidates {
 				payload := []byte(c.ToJSON().Candidate)
-				wsHandler.SendMessage(WebsocketPacket{1, 4, string(payload)})
+				wsHandler.SendMessage(WebsocketPacket{uint64(*clientID), 4, string(payload)})
 			}
 			candidatesMux.Unlock()
 			state = Answer
-			println("Current state:", state)
+			fmt.Printf("WebRTCPeer: Current state: %d\n", state)
 		case 4: // candidate
-			println("Received candidate")
+			fmt.Println("WebRTCPeer: Received candidate")
 			candidate := wsPacket.Message
 			if candidateErr := peerConnection.AddICECandidate(webrtc.ICECandidateInit{Candidate: candidate}); candidateErr != nil {
 				panic(candidateErr)
 			}
 		default:
-			println(fmt.Sprintf("Received non-compliant message type %d", wsPacket.MessageType))
+			fmt.Printf("WebRTCPeer: Received non-compliant message type %d\n", wsPacket.MessageType)
 		}
 	}
 
 	wsHandler.StartListening(handleMessageCallback)
-	wsHandler.SendMessage(WebsocketPacket{1, 1, "Hello"})
+	wsHandler.SendMessage(WebsocketPacket{uint64(*clientID), 1, "Hello"})
 
 	// Block forever
 	select {}
@@ -408,12 +368,10 @@ func (s *TrackLocalCloudRTP) Bind(t webrtc.TrackLocalContext) (webrtc.RTPCodecPa
 	if err != nil {
 		return codec, err
 	}
-
 	// We only need one packetizer
 	if s.packetizer != nil {
 		return codec, nil
 	}
-
 	s.sequencer = rtp.NewRandomSequencer()
 	ui64, err := strconv.ParseUint(s.StreamID(), 10, 64)
 	if err != nil {
@@ -427,7 +385,6 @@ func (s *TrackLocalCloudRTP) Bind(t webrtc.TrackLocalContext) (webrtc.RTPCodecPa
 		s.sequencer,
 		codec.ClockRate,
 	)
-
 	s.clockRate = float64(codec.RTPCodecCapability.ClockRate)
 	return codec, err
 }
@@ -460,25 +417,19 @@ func (s *TrackLocalCloudRTP) Codec() webrtc.RTPCodecCapability {
 func (s *TrackLocalCloudRTP) WriteFrame(t Transcoder, tile uint32) error {
 	p := s.packetizer
 	clockRate := s.clockRate
-
 	if p == nil {
 		return nil
 	}
-
 	samples := uint32(1 * clockRate)
-	frameData := t.EncodeFrame(tile)
-	if frameData != nil {
-		packets := p.Packetize(frameData.Data, samples)
-		writeErrs := []error{}
+	data := t.EncodeFrame(tile)
+	if data != nil {
+		packets := p.Packetize(data, samples)
 		counter := 0
 		for _, p := range packets {
 			if err := s.rtpTrack.WriteRTP(p); err != nil {
-				writeErrs = append(writeErrs, err)
+				fmt.Printf("WebRTCPeer: ERROR: %s\n", err)
 			}
 			counter += 1
-		}
-		if len(writeErrs) > 0 {
-			println(writeErrs)
 		}
 	}
 	return nil
@@ -501,29 +452,19 @@ func (p *PointCloudPayloader) Payload(mtu uint16, payload []byte) (payloads [][]
 		if payloadRemaining < currentFragmentSize {
 			currentFragmentSize = payloadRemaining
 		}
-		p := NewFramePacket(p.frameCounter, p.tile, payloadLen, payloadDataOffset, currentFragmentSize, payload)
-		buf := new(bytes.Buffer)
-
-		if err := binary.Write(buf, binary.LittleEndian, p); err != nil {
-			panic(err)
-		}
-		payloads = append(payloads, buf.Bytes())
+		buf := make([]byte, currentFragmentSize+24)
+		binary.LittleEndian.PutUint32(buf[0:], uint32(*clientID))
+		binary.LittleEndian.PutUint32(buf[4:], p.frameCounter)
+		binary.LittleEndian.PutUint32(buf[8:], p.tile)
+		binary.LittleEndian.PutUint32(buf[12:], payloadLen)
+		binary.LittleEndian.PutUint32(buf[16:], payloadDataOffset)
+		binary.LittleEndian.PutUint32(buf[20:], currentFragmentSize)
+		copy(buf[24:], payload[payloadDataOffset:(payloadDataOffset+currentFragmentSize)])
+		payloads = append(payloads, buf)
 		payloadDataOffset += currentFragmentSize
 		payloadRemaining -= currentFragmentSize
 	}
 	p.frameCounter++
-	/*
-		for index, element := range payloads {
-			var y RemoteInputPacketHeader
-			err := binary.Read(bytes.NewBuffer((element[:20])), binary.LittleEndian, &y)
-			if err != nil {
-				fmt.Println("Error:", err)
-				fmt.Println("QUITING")
-				return
-			}
-			fmt.Println("Packet ", index, y.Framenr, y.Tilenr, y.Packetlen, y.Frameoffset, y.Tilelen)
-		}
-	*/
 	return payloads
 }
 
